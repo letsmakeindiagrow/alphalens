@@ -173,54 +173,53 @@ function stats(trades, equity, initCap) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// MOCK OHLCV GENERATOR  (replace with live yfinance in production)
+// REAL DATA FETCHER — Yahoo Finance v8 API (no API key needed)
+// Works directly from browser. Same adjusted data as yfinance.
 // ─────────────────────────────────────────────────────────────────
-function mockOHLCV(symbol, start, end, basePx) {
-  const rows = [];
-  const cur  = new Date(start);
-  const fin  = new Date(end);
-  let px     = basePx || 1000;
-  const seed = symbol.split("").reduce((s,c) => s + c.charCodeAt(0), 0);
-  // Realistic drift: slight upward bias but with meaningful down-cycles
-  let drift  = 0.00008 + (seed % 5) * 0.00005;
-  let trendDays = 0;
-  let trendDir  = 1;
+async function fetchYahooOHLCV(symbol, startDate, endDate) {
+  const p1 = Math.floor(new Date(startDate).getTime() / 1000);
+  const p2 = Math.floor(new Date(endDate).getTime()   / 1000) + 86400;
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}`
+            + `?interval=1d&period1=${p1}&period2=${p2}&events=splits`;
 
-  while (cur <= fin) {
-    if (cur.getDay() !== 0 && cur.getDay() !== 6) {
-      // Switch trend every 20-60 days for realistic bull/bear cycles
-      trendDays++;
-      if (trendDays > 20 + (seed % 40)) {
-        trendDir  = Math.random() < 0.55 ? 1 : -1; // slight bullish bias
-        trendDays = 0;
-        drift     = (0.00008 + Math.random() * 0.0002) * trendDir;
-      }
-      const vol   = (Math.random() - 0.5) * 0.022; // daily volatility
-      const chg   = vol + drift;
-      const open  = px;
-      const close = Math.max(5, px * (1 + chg));
-      const high  = Math.max(open, close) * (1 + Math.random() * 0.012);
-      const low   = Math.min(open, close) * (1 - Math.random() * 0.012);
-      rows.push({ date: cur.toISOString().slice(0,10),
-        open: +open.toFixed(2), high: +high.toFixed(2),
-        low: +low.toFixed(2), close: +close.toFixed(2) });
-      px = close;
+  try {
+    const res  = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    const result = json?.chart?.result?.[0];
+    if (!result) throw new Error("No data in response");
+
+    const timestamps = result.timestamp || [];
+    const q          = result.indicators.quote[0];
+    const adjClose   = result.indicators.adjclose?.[0]?.adjclose || q.close;
+
+    const rows = [];
+    for (let i = 0; i < timestamps.length; i++) {
+      const o = q.open[i], h = q.high[i], l = q.low[i];
+      const c = q.close[i], ac = adjClose[i];
+      // Skip days with null/zero values (holidays sometimes sneak in)
+      if (!o || !h || !l || !c || !ac) continue;
+
+      // Adjust OHLC for splits & dividends using the adjclose ratio
+      const adj = ac / c;
+      rows.push({
+        date:  new Date(timestamps[i] * 1000).toISOString().slice(0, 10),
+        open:  +(o * adj).toFixed(2),
+        high:  +(h * adj).toFixed(2),
+        low:   +(l * adj).toFixed(2),
+        close: +ac.toFixed(2),
+      });
     }
-    cur.setDate(cur.getDate() + 1);
+    return rows.length > 0 ? rows : null;
+  } catch (e) {
+    console.warn(`Yahoo fetch failed for ${symbol}:`, e.message);
+    return null;
   }
-  return rows;
 }
 
 // ─────────────────────────────────────────────────────────────────
 // PRESETS
 // ─────────────────────────────────────────────────────────────────
-const BASE_PRICES = {
-  "RELIANCE.NS":2800,"TCS.NS":3700,"INFY.NS":1600,"HDFCBANK.NS":1700,
-  "ICICIBANK.NS":1100,"LT.NS":3500,"SBIN.NS":800,"WIPRO.NS":500,
-  "BAJFINANCE.NS":7000,"HINDUNILVR.NS":2500,"HCLTECH.NS":1400,
-  "TECHM.NS":1200,"AXISBANK.NS":1100,"KOTAKBANK.NS":1800,
-  "MARUTI.NS":9000,"TATAMOTORS.NS":600,"NESTLEIND.NS":2200,"TITAN.NS":3300,
-};
 
 const PRESETS = {
   "Nifty 50 Sample": [
@@ -329,7 +328,7 @@ export default function AlphaLens() {
   const [inputMode,    setInputMode]    = useState("preset");
   const [custom,       setCustom]       = useState("");
   const [running,      setRunning]      = useState(false);
-  const [progress,     setProgress]     = useState({n:0,t:0});
+  const [progress,     setProgress]     = useState({n:0,t:0,status:"",failed:[]});
   const [results,      setResults]      = useState(null);
   const [activeSymbol, setActiveSymbol] = useState(null);
   const [tab,          setTab]          = useState("overview");
@@ -353,39 +352,64 @@ export default function AlphaLens() {
   // ── Run ─────────────────────────────────────────────────────
   const run = useCallback(async () => {
     if (!stockList.length) return;
-    setRunning(true); setResults(null); setProgress({n:0,t:stockList.length});
+    setRunning(true); setResults(null);
+    setProgress({n:0, t:stockList.length, status:"", failed:[]});
 
     const stockRes = [];
-    // Each stock gets an equal share of the total capital.
-    // e.g. ₹50L across 50 stocks = ₹1L per stock.
+    const failed   = [];
+    // Split capital equally across stocks
     const perStockCap = +initCap / stockList.length;
-    for (let i=0; i<stockList.length; i++) {
+
+    for (let i = 0; i < stockList.length; i++) {
       const s = stockList[i];
-      await new Promise(r => setTimeout(r, 10));
-      const basePx = (BASE_PRICES[s.symbol] || 1200) * 0.55;
-      const ohlcv  = mockOHLCV(s.symbol, startDate, endDate, basePx);
+      setProgress(p => ({...p, n:i, status:`Fetching ${s.symbol}…`}));
+
+      // ── Fetch REAL data from Yahoo Finance ──────────────────
+      let ohlcv = await fetchYahooOHLCV(s.symbol, startDate, endDate);
+
+      if (!ohlcv || ohlcv.length < 5) {
+        failed.push(s.symbol);
+        setProgress(p => ({...p, failed:[...p.failed, s.symbol]}));
+        continue;
+      }
+
+      setProgress(p => ({...p, status:`Running ${s.symbol} (${ohlcv.length} days)…`}));
+      await new Promise(r => setTimeout(r, 0)); // yield to UI
+
       const { trades, equity } = runBacktest(ohlcv, model, +fixedAmt, perStockCap);
       const st = stats(trades, equity, perStockCap);
       stockRes.push({ ...s, trades, equity, stats:st, ohlcv, perStockCap });
-      setProgress({n:i+1, t:stockList.length});
+      setProgress(p => ({...p, n:i+1, status:`Done ${s.name} — ${trades.length} lots`}));
     }
 
-    // Portfolio equity = sum of all per-stock equities (aligned by date)
-    const allDates = [...new Set(stockRes.flatMap(r=>r.equity.map(p=>p.date)))].sort();
-    const portEq = allDates.map(date => ({
+    if (!stockRes.length) {
+      setRunning(false);
+      setProgress(p => ({...p, status:"❌ All fetches failed. Check symbols or internet."}));
+      return;
+    }
+
+    setProgress(p => ({...p, status:"Building portfolio…"}));
+    await new Promise(r => setTimeout(r, 0));
+
+    const allDates = [...new Set(stockRes.flatMap(r => r.equity.map(p => p.date)))].sort();
+    const portEq   = allDates.map(date => ({
       date,
-      equity: stockRes.reduce((sum,r) => {
-        const pt = r.equity.find(p=>p.date===date);
-        return sum + (pt ? pt.equity : r.equity[0]?.equity || +initCap);
+      equity: stockRes.reduce((sum, r) => {
+        const pt = r.equity.find(p => p.date === date);
+        return sum + (pt ? pt.equity : r.equity[0]?.equity || perStockCap);
       }, 0),
     }));
 
-    const allTrades  = stockRes.flatMap(r => r.trades.map(t=>({...t,symbol:r.symbol,name:r.name})));
-    // Portfolio baseline = sum of all per-stock starting capitals = total initCap
+    const allTrades = stockRes.flatMap(r =>
+      r.trades.map(t => ({...t, symbol:r.symbol, name:r.name}))
+    );
     const portInitCap = portEq.length > 0 ? portEq[0].equity : +initCap;
-    const portStats  = stats(allTrades, portEq, portInitCap);
-    setResults({ stockRes, portEq, portStats, allTrades });
+    const portStats   = stats(allTrades, portEq, portInitCap);
+
+    setResults({ stockRes, portEq, portStats, allTrades, failed });
     setActiveSymbol(stockRes[0]?.symbol || null);
+    setProgress(p => ({...p, n:stockList.length,
+      status:`✅ Complete — ${stockRes.length} stocks, ${allTrades.length} lots`}));
     setRunning(false);
   }, [stockList, startDate, endDate, initCap, model, fixedAmt]);
 
@@ -482,7 +506,7 @@ export default function AlphaLens() {
         </div>
         <div style={{ display:"flex", alignItems:"center", gap:10 }}>
           <span style={{ fontSize:10, color:C.muted, fontFamily:"DM Mono,monospace" }}>
-            ⚡ Demo mode — wire fetch_ohlcv() to live yfinance for production
+            Live data via Yahoo Finance · NSE/BSE supported
           </span>
           <div style={{ padding:"3px 10px", borderRadius:20, fontSize:10,
             background:`${C.accent}18`, color:C.accent, border:`1px solid ${C.accent}33`,
@@ -604,10 +628,31 @@ export default function AlphaLens() {
           </button>
 
           {running && (
-            <div style={{ background:C.border, borderRadius:3, height:3, overflow:"hidden" }}>
-              <div style={{ height:"100%", borderRadius:3,
-                background:`linear-gradient(90deg,${C.accent},${C.accent2})`,
-                width:`${(progress.n/progress.t)*100}%`, transition:"width .3s" }} />
+            <div style={{display:"flex", flexDirection:"column", gap:6}}>
+              <div style={{ background:C.border, borderRadius:3, height:3, overflow:"hidden" }}>
+                <div style={{ height:"100%", borderRadius:3,
+                  background:`linear-gradient(90deg,${C.accent},${C.accent2})`,
+                  width:`${progress.t ? (progress.n/progress.t)*100 : 0}%`,
+                  transition:"width .3s" }} />
+              </div>
+              <div style={{fontSize:10, color:C.textSoft, fontFamily:"DM Mono,monospace",
+                wordBreak:"break-all"}}>{progress.status}</div>
+            </div>
+          )}
+
+          {/* Failed symbols warning */}
+          {!running && results?.failed?.length > 0 && (
+            <div style={{background:`${C.red}11`, border:`1px solid ${C.red}33`,
+              borderRadius:7, padding:"8px 10px", fontSize:11}}>
+              <div style={{color:C.red, fontWeight:700, marginBottom:4}}>
+                ⚠ {results.failed.length} symbol(s) failed to fetch:
+              </div>
+              <div style={{color:C.muted, fontFamily:"DM Mono,monospace", fontSize:10}}>
+                {results.failed.join(", ")}
+              </div>
+              <div style={{color:C.muted, fontSize:10, marginTop:4}}>
+                Check symbol names — use .NS for NSE, .BO for BSE
+              </div>
             </div>
           )}
         </aside>
@@ -626,6 +671,7 @@ export default function AlphaLens() {
               <div style={{ color:C.textSoft, fontSize:14, textAlign:"center", maxWidth:460, lineHeight:1.7 }}>
                 Configure your universe, capital, investment model and date range on the left —
                 then click <b style={{color:C.accent}}>Run Backtest</b>.
+                Real historical data is fetched live from Yahoo Finance.
               </div>
               <div style={{ display:"flex", gap:16, flexWrap:"wrap", justifyContent:"center", marginTop:4 }}>
                 {["Equity Curve","Max Drawdown","Sharpe Ratio","CAGR","Win Rate",
