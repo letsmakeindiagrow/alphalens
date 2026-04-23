@@ -34,67 +34,32 @@ function getLotCap(model, fixedAmt, initialCap, prevBal) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-// YAHOO FINANCE FETCHER
-// Tries 3 methods in order until one works:
-//   1. Direct Yahoo Finance API (works when CORS allows)
-//   2. allorigins CORS proxy
-//   3. corsproxy.io
+// DATA FETCHER
+// Calls our own Vercel serverless function at /api/ohlcv
+// This runs server-side so there are zero CORS issues.
+// The serverless function fetches Yahoo Finance and returns clean JSON.
 // ─────────────────────────────────────────────────────────────────
 async function fetchYahooOHLCV(symbol, startDate, endDate) {
-  const p1  = Math.floor(new Date(startDate).getTime() / 1000);
-  const p2  = Math.floor(new Date(endDate).getTime()   / 1000) + 86400;
-  const yUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&period1=${p1}&period2=${p2}&events=splits`;
+  try {
+    const params = new URLSearchParams({ symbol, start: startDate, end: endDate });
+    const res    = await fetch(`/api/ohlcv?${params}`, {
+      signal: AbortSignal.timeout(20000),
+    });
 
-  // Three URLs to try in order
-  const attempts = [
-    // Attempt 1: direct (works on some hosts / when Yahoo allows)
-    { url: yUrl, direct: true },
-    // Attempt 2: allorigins proxy (free, reliable)
-    { url: `https://api.allorigins.win/get?url=${encodeURIComponent(yUrl)}`, proxy: "allorigins" },
-    // Attempt 3: corsproxy.io
-    { url: `https://corsproxy.io/?${encodeURIComponent(yUrl)}`, proxy: "corsproxy" },
-  ];
-
-  for (const attempt of attempts) {
-    try {
-      const res = await fetch(attempt.url, { signal: AbortSignal.timeout(15000) });
-      if (!res.ok) continue;
-
-      let json;
-      if (attempt.proxy === "allorigins") {
-        const wrapper = await res.json();
-        json = JSON.parse(wrapper.contents);
-      } else {
-        json = await res.json();
-      }
-
-      const result = json?.chart?.result?.[0];
-      if (!result?.timestamp?.length) continue;
-
-      const timestamps = result.timestamp;
-      const q          = result.indicators.quote[0];
-      const adjClose   = result.indicators.adjclose?.[0]?.adjclose || q.close;
-
-      const rows = [];
-      for (let i = 0; i < timestamps.length; i++) {
-        const o = q.open[i], h = q.high[i], l = q.low[i];
-        const c = q.close[i], ac = adjClose[i];
-        if (o == null || h == null || l == null || c == null || !ac || c === 0) continue;
-        const adj = ac / c;
-        rows.push({
-          date:  new Date(timestamps[i] * 1000).toISOString().slice(0, 10),
-          open:  +(o * adj).toFixed(2),
-          high:  +(h * adj).toFixed(2),
-          low:   +(l * adj).toFixed(2),
-          close: +ac.toFixed(2),
-        });
-      }
-      if (rows.length > 10) return rows;  // success
-    } catch (e) {
-      // try next
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      console.warn(`/api/ohlcv failed for ${symbol}:`, err.error || res.status);
+      return null;
     }
+
+    const data = await res.json();
+    if (!data.rows?.length) return null;
+    return data.rows;
+
+  } catch (e) {
+    console.warn(`Fetch error for ${symbol}:`, e.message);
+    return null;
   }
-  return null;  // all failed
 }
 
 // ─────────────────────────────────────────────────────────────────
