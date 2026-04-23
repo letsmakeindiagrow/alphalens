@@ -1,4 +1,3 @@
-
 import { useState, useCallback, useMemo } from "react";
 import {
   AreaChart, Area, BarChart, Bar, Cell,
@@ -182,21 +181,30 @@ function mockOHLCV(symbol, start, end, basePx) {
   const fin  = new Date(end);
   let px     = basePx || 1000;
   const seed = symbol.split("").reduce((s,c) => s + c.charCodeAt(0), 0);
-  let drift  = 0.00025 + (seed % 7) * 0.00008;
+  // Realistic drift: slight upward bias but with meaningful down-cycles
+  let drift  = 0.00008 + (seed % 5) * 0.00005;
+  let trendDays = 0;
+  let trendDir  = 1;
 
   while (cur <= fin) {
     if (cur.getDay() !== 0 && cur.getDay() !== 6) {
-      const chg   = (Math.random() - 0.48) * 0.028 + drift;
+      // Switch trend every 20-60 days for realistic bull/bear cycles
+      trendDays++;
+      if (trendDays > 20 + (seed % 40)) {
+        trendDir  = Math.random() < 0.55 ? 1 : -1; // slight bullish bias
+        trendDays = 0;
+        drift     = (0.00008 + Math.random() * 0.0002) * trendDir;
+      }
+      const vol   = (Math.random() - 0.5) * 0.022; // daily volatility
+      const chg   = vol + drift;
       const open  = px;
       const close = Math.max(5, px * (1 + chg));
-      const high  = Math.max(open, close) * (1 + Math.random() * 0.015);
-      const low   = Math.min(open, close) * (1 - Math.random() * 0.015);
+      const high  = Math.max(open, close) * (1 + Math.random() * 0.012);
+      const low   = Math.min(open, close) * (1 - Math.random() * 0.012);
       rows.push({ date: cur.toISOString().slice(0,10),
         open: +open.toFixed(2), high: +high.toFixed(2),
         low: +low.toFixed(2), close: +close.toFixed(2) });
       px = close;
-      if (Math.random() < 0.03) drift = -Math.abs(drift);
-      else if (Math.random() < 0.03) drift =  Math.abs(drift);
     }
     cur.setDate(cur.getDate() + 1);
   }
@@ -348,14 +356,17 @@ export default function AlphaLens() {
     setRunning(true); setResults(null); setProgress({n:0,t:stockList.length});
 
     const stockRes = [];
+    // Each stock gets an equal share of the total capital.
+    // e.g. ₹50L across 50 stocks = ₹1L per stock.
+    const perStockCap = +initCap / stockList.length;
     for (let i=0; i<stockList.length; i++) {
       const s = stockList[i];
       await new Promise(r => setTimeout(r, 10));
       const basePx = (BASE_PRICES[s.symbol] || 1200) * 0.55;
       const ohlcv  = mockOHLCV(s.symbol, startDate, endDate, basePx);
-      const { trades, equity } = runBacktest(ohlcv, model, +fixedAmt, +initCap);
-      const st = stats(trades, equity, +initCap);
-      stockRes.push({ ...s, trades, equity, stats:st, ohlcv });
+      const { trades, equity } = runBacktest(ohlcv, model, +fixedAmt, perStockCap);
+      const st = stats(trades, equity, perStockCap);
+      stockRes.push({ ...s, trades, equity, stats:st, ohlcv, perStockCap });
       setProgress({n:i+1, t:stockList.length});
     }
 
@@ -370,7 +381,9 @@ export default function AlphaLens() {
     }));
 
     const allTrades  = stockRes.flatMap(r => r.trades.map(t=>({...t,symbol:r.symbol,name:r.name})));
-    const portStats  = stats(allTrades, portEq, +initCap * stockRes.length);
+    // Portfolio baseline = sum of all per-stock starting capitals = total initCap
+    const portInitCap = portEq.length > 0 ? portEq[0].equity : +initCap;
+    const portStats  = stats(allTrades, portEq, portInitCap);
     setResults({ stockRes, portEq, portStats, allTrades });
     setActiveSymbol(stockRes[0]?.symbol || null);
     setRunning(false);
