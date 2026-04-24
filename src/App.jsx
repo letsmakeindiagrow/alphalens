@@ -35,27 +35,25 @@ function getLotCap(model, fixedAmt, initialCap, prevBal) {
 
 // ─────────────────────────────────────────────────────────────────
 // DATA FETCHER
-// Calls our own Vercel serverless function at /api/ohlcv
-// This runs server-side so there are zero CORS issues.
-// The serverless function fetches Yahoo Finance and returns clean JSON.
+// Calls our Vercel serverless function at /api/ohlcv
+// The function checks Aiven PostgreSQL cache first,
+// only hits Yahoo Finance if data is missing or stale.
+// Returns { rows, source } where source = "cache" | "yahoo_saved" | etc.
 // ─────────────────────────────────────────────────────────────────
-async function fetchYahooOHLCV(symbol, startDate, endDate) {
+async function fetchOHLCV(symbol, startDate, endDate) {
   try {
     const params = new URLSearchParams({ symbol, start: startDate, end: endDate });
     const res    = await fetch(`/api/ohlcv?${params}`, {
-      signal: AbortSignal.timeout(20000),
+      signal: AbortSignal.timeout(25000),
     });
-
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       console.warn(`/api/ohlcv failed for ${symbol}:`, err.error || res.status);
       return null;
     }
-
     const data = await res.json();
     if (!data.rows?.length) return null;
-    return data.rows;
-
+    return { rows: data.rows, source: data.source || "unknown", count: data.count };
   } catch (e) {
     console.warn(`Fetch error for ${symbol}:`, e.message);
     return null;
@@ -389,23 +387,25 @@ function AlphaLens() {
       setProgress(p => ({...p, n:i, msg:`Fetching ${s.symbol}…`}));
       await new Promise(r => setTimeout(r, 0));  // yield to UI
 
-      const ohlcv = await fetchYahooOHLCV(s.symbol, startDate, endDate);
+      const result = await fetchOHLCV(s.symbol, startDate, endDate);
 
-      if (!ohlcv || ohlcv.length < 5) {
+      if (!result || result.rows.length < 5) {
         failed.push(s.symbol);
         setProgress(p => ({...p, failed:[...p.failed, s.symbol],
           msg:`⚠ ${s.symbol} failed — skipping`}));
         continue;
       }
 
-      setProgress(p => ({...p, msg:`Backtesting ${s.name} (${ohlcv.length} days)…`}));
+      const { rows: ohlcv, source } = result;
+      const srcLabel = source === "cache" ? "⚡ cached" : "🌐 fetched";
+      setProgress(p => ({...p, msg:`Backtesting ${s.name} (${ohlcv.length} days · ${srcLabel})…`}));
       await new Promise(r => setTimeout(r, 0));
 
       const {trades, equity} = runBacktest(ohlcv, model, +fixedAmt, perStockCap);
       const st = calcStats(trades, equity, perStockCap);
       stockRes.push({...s, trades, equity, stats:st});
       setProgress(p => ({...p, n:i+1,
-        msg:`✓ ${s.name}: ${trades.length} lots, P&L ${fmtC(st.totalPnL)}`}));
+        msg:`✓ ${s.name} (${srcLabel}): ${trades.length} lots · P&L ${fmtC(st.totalPnL)}`}));
     }
 
     if (!stockRes.length) {
