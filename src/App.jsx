@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, Component } from "react";
 import {
   AreaChart, Area, BarChart, Bar, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip,
@@ -300,9 +300,46 @@ const CTip = ({active, payload, label}) => {
 };
 
 // ─────────────────────────────────────────────────────────────────
+// ERROR BOUNDARY — catches render crashes and shows message
+// instead of white blank screen
+// ─────────────────────────────────────────────────────────────────
+class ErrorBoundary extends Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(e) { return { error: e }; }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{minHeight:"100vh",background:"#080b12",color:"#dde4f0",
+          display:"flex",flexDirection:"column",alignItems:"center",
+          justifyContent:"center",gap:16,padding:32,fontFamily:"DM Sans,sans-serif"}}>
+          <div style={{fontSize:32}}>⚠️</div>
+          <div style={{fontFamily:"Syne,sans-serif",fontSize:22,fontWeight:800}}>
+            Something went wrong</div>
+          <div style={{color:"#7a8ba0",fontSize:13,textAlign:"center",maxWidth:480}}>
+            A rendering error occurred. Please open browser DevTools (F12) →
+            Console to see the exact error, then share it for a fix.
+          </div>
+          <pre style={{background:"#0f1420",border:"1px solid #1a2236",borderRadius:8,
+            padding:"12px 16px",fontSize:11,color:"#f05f4d",maxWidth:640,
+            overflow:"auto",whiteSpace:"pre-wrap"}}>
+            {this.state.error?.message}
+          </pre>
+          <button onClick={()=>this.setState({error:null})} style={{
+            padding:"10px 24px",borderRadius:8,border:"none",cursor:"pointer",
+            background:"#00e5b0",color:"#000",fontWeight:700,fontSize:14}}>
+            Try Again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // MAIN APP
 // ─────────────────────────────────────────────────────────────────
-export default function AlphaLens() {
+function AlphaLens() {
   const [startDate,    setStartDate]    = useState("2015-01-01");
   const [endDate,      setEndDate]      = useState(new Date().toISOString().slice(0,10));
   const [initCap,      setInitCap]      = useState(1000000);
@@ -401,10 +438,10 @@ export default function AlphaLens() {
   }, [stockList, startDate, endDate, initCap, model, fixedAmt, running]);
 
   // ── Derived data for display ─────────────────────────────────
-  const active     = results?.stockRes?.find(r=>r.symbol===activeSymbol);
-  const curveData  = active ? active.equity  : results?.portEq;
-  const statsData  = active ? active.stats   : results?.portStats;
-  const viewLabel  = active ? active.name    : "Portfolio";
+  const active     = results?.stockRes?.find(r=>r.symbol===activeSymbol) || null;
+  const curveData  = (active ? active.equity : results?.portEq) || [];
+  const statsData  = (active ? active.stats  : results?.portStats) || null;
+  const viewLabel  = active ? active.name : "Portfolio";
 
   const ddSeries = useMemo(() => {
     if (!curveData?.length) return [];
@@ -691,7 +728,7 @@ export default function AlphaLens() {
           )}
 
           {/* ── RESULTS ── */}
-          {results && !running && (<>
+          {results && !running && statsData && (<>
 
             {/* Stock tabs */}
             <div style={{display:"flex",gap:5,flexWrap:"wrap",marginBottom:16}}>
@@ -783,7 +820,7 @@ export default function AlphaLens() {
                       <YAxis tick={{fill:C.muted,fontSize:9}} width={64}
                         tickFormatter={v=>`₹${(v/1e5).toFixed(0)}L`}/>
                       <Tooltip content={<CTip/>}/>
-                      <ReferenceLine y={active?active.perStockCap:portEq?.[0]?.equity}
+                      <ReferenceLine y={active ? (active.perStockCap||0) : (results?.portEq?.[0]?.equity||0)}
                         stroke={C.muted} strokeDasharray="4 2"/>
                       <Area type="monotone" dataKey="equity" name="Equity"
                         stroke={C.accent} fill="url(#ge)" strokeWidth={2} dot={false}/>
@@ -1072,3 +1109,12 @@ export default function AlphaLens() {
     </div>
   );
 }
+
+// Wrap with error boundary so crashes show message not blank screen
+const AlphaLensWithBoundary = () => (
+  <ErrorBoundary>
+    <AlphaLens />
+  </ErrorBoundary>
+);
+
+export default AlphaLensWithBoundary;
